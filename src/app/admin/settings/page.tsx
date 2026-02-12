@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { updateConfigAction, refreshNotionData } from "@/app/admin/actions"
 import { getSystemConfig } from "@/lib/notion"
+import RefreshButton from "./refresh-button"
 
 export default async function SettingsPage() {
     const config = await getSystemConfig();
