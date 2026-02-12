@@ -87,6 +87,30 @@ export default async function SettingsPage() {
                             />
                             <p className="text-xs text-muted-foreground">當使用者輸入包含這些關鍵字時，系統將暫停 AI 並通知管理員。</p>
                         </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                                <Label htmlFor="auto_switch_minutes">自動切回 AI 模式 (分鐘)</Label>
+                                <Input
+                                    type="number"
+                                    id="auto_switch_minutes"
+                                    name="auto_switch_minutes"
+                                    defaultValue={config?.AUTO_SWITCH_MINUTES || "1"}
+                                    placeholder="1"
+                                />
+                                <p className="text-xs text-muted-foreground">真人模式閒置超過此時間後，自動切回 AI (測試預設: 1分鐘)。</p>
+                            </div>
+                            <div className="space-y-2">
+                                <Label htmlFor="admin_line_id">管理員 LINE ID (通知對象)</Label>
+                                <Input
+                                    id="admin_line_id"
+                                    name="admin_line_id"
+                                    defaultValue={config?.ADMIN_LINE_ID || ""}
+                                    placeholder="Uxxxxxxxx..."
+                                />
+                                <p className="text-xs text-muted-foreground">請填寫您的 LINE User ID 以接收轉真人通知。</p>
+                            </div>
+                        </div>
                     </CardContent>
                 </Card>
 

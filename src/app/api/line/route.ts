@@ -26,7 +26,13 @@ export async function POST(req: NextRequest) {
                 return;
             }
 
+            if (event.type !== 'message' || event.message.type !== 'text') {
+                return;
+            }
+
             const userId = event.source.userId;
+            if (!userId) return;
+
             const userMessage = event.message.text;
             const replyToken = event.replyToken;
 
@@ -49,10 +55,23 @@ export async function POST(req: NextRequest) {
 
             // 2. Check Chat Mode
             if (chatSession && chatSession.mode === 'Human') {
-                console.log(`[LINE] User ${userId} is in Human mode. Ignoring message (waiting for admin reply).`);
-                // Update last active time
-                await updateChatSession(userId, 'Human');
-                return;
+                console.log(`[LINE] User ${userId} is in Human mode.`);
+
+                // Check Auto Switch Timeout
+                const lastActive = new Date(chatSession.lastActive).getTime();
+                const now = Date.now();
+                const timeoutMinutes = systemConfig?.AUTO_SWITCH_MINUTES || 1;
+                const timeoutMs = timeoutMinutes * 60 * 1000;
+
+                if (now - lastActive > timeoutMs) {
+                    console.log(`[LINE] User ${userId} session timed out. Switching back to AI.`);
+                    await updateChatSession(userId, 'AI');
+                    // Proceed to AI flow...
+                } else {
+                    // Update last active time and ignore (waiting for admin)
+                    await updateChatSession(userId, 'Human');
+                    return;
+                }
             }
 
             // 3. Check Handover Keywords
@@ -69,6 +88,19 @@ export async function POST(req: NextRequest) {
                         text: '已為您轉接專人客服，請稍候，我們將盡快回覆您。'
                     }]
                 });
+
+                // Notify Admin
+                const adminLineId = systemConfig?.ADMIN_LINE_ID;
+                if (adminLineId) {
+                    await lineClient.pushMessage({
+                        to: adminLineId,
+                        messages: [{
+                            type: 'text',
+                            text: `[系統通知] 用戶觸發真人客服請求！\n\n用戶ID: ${userId}\n訊息內容: ${userMessage}`
+                        }]
+                    }).catch(e => console.error("Failed to notify admin", e));
+                }
+
                 return;
             }
 

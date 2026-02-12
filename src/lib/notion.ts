@@ -113,6 +113,8 @@ export interface SystemConfig {
   MODEL_NAME: string;
   SYSTEM_PROMPT?: string;
   HANDOVER_KEYWORDS?: string[];
+  AUTO_SWITCH_MINUTES?: number;
+  ADMIN_LINE_ID?: string;
 }
 
 export async function getSystemConfig(): Promise<SystemConfig | null> {
@@ -128,10 +130,6 @@ export async function getSystemConfig(): Promise<SystemConfig | null> {
     response.results.forEach((page: any) => {
       const props = page.properties;
       // Expecting "Key" (Title) and "Value" (RichText/Checkbox)
-      // This needs to match the user's DB setup structure strictly.
-      // We will assume a simple Key-Value structure:
-      // Key: Title
-      // Value: RichText (or Checkbox for boolean if feasible, but text is safer for compatibility)
 
       let key = "";
       let value: any = "";
@@ -148,6 +146,7 @@ export async function getSystemConfig(): Promise<SystemConfig | null> {
         // Type conversion
         if (value === 'true') config[key] = true;
         else if (value === 'false') config[key] = false;
+        else if (!isNaN(Number(value)) && key === 'AUTO_SWITCH_MINUTES') config[key] = Number(value);
         else config[key] = value;
       }
     });
@@ -162,6 +161,55 @@ export async function getSystemConfig(): Promise<SystemConfig | null> {
   } catch (error) {
     console.error("Error fetching system config:", error);
     return null;
+  }
+}
+
+export async function updateSystemConfig(key: string, value: string | boolean) {
+  if (!NOTION_CONFIG_DB_ID) return;
+
+  // 1. Check if key exists
+  const response = await notion.databases.query({
+    database_id: NOTION_CONFIG_DB_ID,
+    filter: {
+      property: 'Key',
+      title: {
+        equals: key
+      }
+    }
+  });
+
+  const strValue = String(value);
+
+  if (response.results.length > 0) {
+    // Update existing
+    const pageId = response.results[0].id;
+    await notion.pages.update({
+      page_id: pageId,
+      properties: {
+        Value: {
+          rich_text: [
+            { text: { content: strValue } }
+          ]
+        }
+      }
+    });
+  } else {
+    // Create new
+    await notion.pages.create({
+      parent: { database_id: NOTION_CONFIG_DB_ID },
+      properties: {
+        Key: {
+          title: [
+            { text: { content: key } }
+          ]
+        },
+        Value: {
+          rich_text: [
+            { text: { content: strValue } }
+          ]
+        }
+      }
+    });
   }
 }
 
@@ -203,6 +251,33 @@ export async function getChatSession(lineUserId: string): Promise<ChatSession | 
   } catch (error) {
     console.error("Error fetching chat session:", error);
     return null;
+  }
+}
+
+export async function getActiveHumanSessions(): Promise<ChatSession[]> {
+  if (!NOTION_SESSION_DB_ID) return [];
+
+  try {
+    const response = await notion.databases.query({
+      database_id: NOTION_SESSION_DB_ID,
+      filter: {
+        property: 'Mode',
+        select: {
+          equals: 'Human'
+        }
+      }
+    });
+
+    return response.results.map((page: any) => ({
+      lineUserId: page.properties.LineUserID.title[0]?.plain_text || 'Unknown',
+      mode: 'Human',
+      lastActive: page.properties.LastActive?.date?.start || new Date().toISOString(),
+      pageId: page.id
+    }));
+
+  } catch (error) {
+    console.error("Error fetching human sessions:", error);
+    return [];
   }
 }
 
