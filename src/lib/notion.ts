@@ -121,7 +121,7 @@ export async function getSystemConfig(): Promise<SystemConfig | null> {
   if (!NOTION_CONFIG_DB_ID) return null;
 
   try {
-    const response = await notion.databases.query({
+    const response = await (notion.databases as any).query({
       database_id: NOTION_CONFIG_DB_ID,
     });
 
@@ -168,7 +168,7 @@ export async function updateSystemConfig(key: string, value: string | boolean) {
   if (!NOTION_CONFIG_DB_ID) return;
 
   // 1. Check if key exists
-  const response = await notion.databases.query({
+  const response = await (notion.databases as any).query({
     database_id: NOTION_CONFIG_DB_ID,
     filter: {
       property: 'Key',
@@ -226,7 +226,7 @@ export async function getChatSession(lineUserId: string): Promise<ChatSession | 
   if (!NOTION_SESSION_DB_ID) return null;
 
   try {
-    const response = await notion.databases.query({
+    const response = await (notion.databases as any).query({
       database_id: NOTION_SESSION_DB_ID,
       filter: {
         property: 'LineUserID',
@@ -258,7 +258,7 @@ export async function getActiveHumanSessions(): Promise<ChatSession[]> {
   if (!NOTION_SESSION_DB_ID) return [];
 
   try {
-    const response = await notion.databases.query({
+    const response = await (notion.databases as any).query({
       database_id: NOTION_SESSION_DB_ID,
       filter: {
         property: 'Mode',
