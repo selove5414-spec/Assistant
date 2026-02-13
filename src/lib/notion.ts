@@ -222,100 +222,125 @@ export interface ChatSession {
   pageId?: string; // Notion Page ID representing this row
 }
 
+
+// --- In-Memory Fallback for Sessions (When DB ID is missing) ---
+const localSessionStore = new Map<string, ChatSession>();
+
 export async function getChatSession(lineUserId: string): Promise<ChatSession | null> {
-  if (!NOTION_SESSION_DB_ID) return null;
-
-  try {
-    const response = await (notion.databases as any).query({
-      database_id: NOTION_SESSION_DB_ID,
-      filter: {
-        property: 'LineUserID',
-        title: {
-          equals: lineUserId
+  // 1. Try Notion DB if configured
+  if (NOTION_SESSION_DB_ID) {
+    try {
+      const response = await (notion.databases as any).query({
+        database_id: NOTION_SESSION_DB_ID,
+        filter: {
+          property: 'LineUserID',
+          title: { equals: lineUserId }
         }
-      }
-    });
+      });
 
-    if (response.results.length === 0) return null;
+      if (response.results.length === 0) return null;
 
-    const page: any = response.results[0];
-    const props = page.properties;
+      const page: any = response.results[0];
+      const props = page.properties;
 
-    return {
-      lineUserId,
-      mode: props.Mode?.select?.name || 'AI',
-      lastActive: props.LastActive?.date?.start || new Date().toISOString(),
-      pageId: page.id
-    };
-
-  } catch (error) {
-    console.error("Error fetching chat session:", error);
-    return null;
+      return {
+        lineUserId,
+        mode: props.Mode?.select?.name || 'AI',
+        lastActive: props.LastActive?.date?.start || new Date().toISOString(),
+        pageId: page.id
+      };
+    } catch (error) {
+      console.error("Error fetching chat session from Notion:", error);
+      // Fallback to local if Notion fails? Or just return null?
+      // Let's fallback to local to be safe during config issues
+    }
   }
+
+  // 2. Fallback to Local Memory
+  return localSessionStore.get(lineUserId) || null;
 }
 
 export async function getActiveHumanSessions(): Promise<ChatSession[]> {
-  if (!NOTION_SESSION_DB_ID) return [];
+  const sessions: ChatSession[] = [];
 
-  try {
-    const response = await (notion.databases as any).query({
-      database_id: NOTION_SESSION_DB_ID,
-      filter: {
-        property: 'Mode',
-        select: {
-          equals: 'Human'
+  // 1. Notion
+  if (NOTION_SESSION_DB_ID) {
+    try {
+      const response = await (notion.databases as any).query({
+        database_id: NOTION_SESSION_DB_ID,
+        filter: {
+          property: 'Mode',
+          select: { equals: 'Human' }
         }
-      }
-    });
-
-    return response.results.map((page: any) => ({
-      lineUserId: page.properties.LineUserID.title[0]?.plain_text || 'Unknown',
-      mode: 'Human',
-      lastActive: page.properties.LastActive?.date?.start || new Date().toISOString(),
-      pageId: page.id
-    }));
-
-  } catch (error) {
-    console.error("Error fetching human sessions:", error);
-    return [];
+      });
+      const notionSessions = response.results.map((page: any) => ({
+        lineUserId: page.properties.LineUserID.title[0]?.plain_text || 'Unknown',
+        mode: 'Human',
+        lastActive: page.properties.LastActive?.date?.start || new Date().toISOString(),
+        pageId: page.id
+      })) as ChatSession[];
+      sessions.push(...notionSessions);
+    } catch (error) {
+      console.error("Error fetching human sessions from Notion:", error);
+    }
   }
+
+  // 2. Local
+  for (const session of localSessionStore.values()) {
+    if (session.mode === 'Human') {
+      // Avoid duplicates if both exist (rare case)
+      if (!sessions.find(s => s.lineUserId === session.lineUserId)) {
+        sessions.push(session);
+      }
+    }
+  }
+
+  return sessions;
 }
 
 export async function updateChatSession(lineUserId: string, mode: 'AI' | 'Human') {
-  if (!NOTION_SESSION_DB_ID) return;
+  const now = new Date().toISOString();
 
-  const existingSession = await getChatSession(lineUserId);
+  // 1. Try Notion
+  if (NOTION_SESSION_DB_ID) {
+    try {
+      const existingSession = await getChatSession(lineUserId); // This might get local one if DB missing, handle carefully
 
-  if (existingSession && existingSession.pageId) {
-    // Update
-    await notion.pages.update({
-      page_id: existingSession.pageId,
-      properties: {
-        Mode: {
-          select: { name: mode }
-        },
-        LastActive: {
-          date: { start: new Date().toISOString() }
-        }
+      // We need to check if the *existingSession* actually has a pageId (meaning it came from Notion)
+      if (existingSession && existingSession.pageId) {
+        await notion.pages.update({
+          page_id: existingSession.pageId,
+          properties: {
+            Mode: { select: { name: mode } },
+            LastActive: { date: { start: now } }
+          }
+        });
+        return; // Success update Notion
+      } else {
+        // Create in Notion
+        await notion.pages.create({
+          parent: { database_id: NOTION_SESSION_DB_ID },
+          properties: {
+            LineUserID: { title: [{ text: { content: lineUserId } }] },
+            Mode: { select: { name: mode } },
+            LastActive: { date: { start: now } }
+          }
+        });
+        return; // Success create Notion
       }
-    });
-  } else {
-    // Create
-    await notion.pages.create({
-      parent: { database_id: NOTION_SESSION_DB_ID },
-      properties: {
-        LineUserID: {
-          title: [
-            { text: { content: lineUserId } }
-          ]
-        },
-        Mode: {
-          select: { name: mode }
-        },
-        LastActive: {
-          date: { start: new Date().toISOString() }
-        }
-      }
-    });
+    } catch (e) {
+      console.error("Failed to update Notion session DB", e);
+      // Continue to update local as backup
+    }
   }
+
+  // 2. Update Local Memory
+  // Be careful not to overwrite a full object with partial info if we were doing more complex stuff, 
+  // but here we just need mode and time.
+  localSessionStore.set(lineUserId, {
+    lineUserId,
+    mode,
+    lastActive: now
+  });
 }
+
