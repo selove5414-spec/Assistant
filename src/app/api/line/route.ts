@@ -8,7 +8,7 @@ import { generateAnswer } from '@/lib/ai';
 const AI_ENABLED = process.env.AI_ENABLED !== 'false'; // Default true
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || '';
 const HANDOVER_KEYWORDS = (process.env.HANDOVER_KEYWORDS || '轉真人,人工客服').split(',').map(k => k.trim());
-const AUTO_SWITCH_MINUTES = parseInt(process.env.AUTO_SWITCH_MINUTES || '1', 10);
+const AUTO_SWITCH_MINUTES = parseInt(process.env.AUTO_SWITCH_MINUTES || '5', 10);
 const ADMIN_LINE_ID = process.env.ADMIN_LINE_ID || '';
 
 export async function POST(req: NextRequest) {
