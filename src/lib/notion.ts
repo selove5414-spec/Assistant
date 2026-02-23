@@ -1,29 +1,27 @@
 import { Client } from '@notionhq/client';
 import { NotionToMarkdown } from 'notion-to-md';
-import { unstable_cache } from 'next/cache';
 
-// Initialize Official Notion Client
-// Ensure NOTION_API_KEY (integration token) is set in .env
+// 初始化 Notion 官方 Client
 const notion = new Client({
   auth: process.env.NOTION_API_KEY,
 });
 
-// Initialize Markdown Converter
+// 初始化 Markdown 轉換器
 const n2m = new NotionToMarkdown({ notionClient: notion });
 
 export interface NotionContext {
   pageId: string;
-  content: string; // Markdown representation
+  content: string; // Markdown 內容
   title?: string;
   lastUpdated: number;
 }
 
-// Database IDs (Expected to be in .env)
+// Database IDs（來自 .env）
 const NOTION_CONFIG_DB_ID = process.env.NOTION_CONFIG_DB_ID || '';
 const NOTION_SESSION_DB_ID = process.env.NOTION_SESSION_DB_ID || '';
 
 /**
- * Validates Notion Page IDs from environment variable
+ * 從環境變數取得 Notion Page IDs
  */
 export function getNotionPageIds(): string[] {
   const ids = process.env.NOTION_PAGE_IDS;
@@ -31,19 +29,44 @@ export function getNotionPageIds(): string[] {
   return ids.split(',').map((id) => id.trim()).filter((id) => id.length > 0);
 }
 
+// ============================================================
+// In-Memory Cache 定義
+// 利用 Serverless Module 層的生命週期，同一個 Instance 內免重複請求
+// ============================================================
+
+interface MemCacheEntry<T> {
+  data: T;
+  expiresAt: number;
+}
+
+/** Notion 知識庫快取（TTL: 1小時） */
+let notionDataCache: MemCacheEntry<{
+  combinedContext: string;
+  pages: NotionContext[];
+  fetchedAt: number;
+}> | null = null;
+const NOTION_DATA_TTL_MS = 60 * 60 * 1000; // 1 小時
+
+/** 系統設定快取（TTL: 5分鐘） */
+let systemConfigCache: MemCacheEntry<SystemConfig | null> | null = null;
+const SYSTEM_CONFIG_TTL_MS = 5 * 60 * 1000; // 5 分鐘
+
+/** 對話 Session 快取 Map（TTL: 2分鐘） */
+const sessionCache = new Map<string, MemCacheEntry<ChatSession | null>>();
+const SESSION_TTL_MS = 2 * 60 * 1000; // 2 分鐘
+
+// ============================================================
+
 /**
- * Fetches data from a single Notion page using Official API.
- * Converts blocks to Markdown string.
+ * 從單一 Notion 頁面讀取資料，轉成 Markdown
  */
 async function fetchNotionPage(pageId: string): Promise<NotionContext | null> {
   try {
-    // 1. Get Page Metadata (Title)
+    // 1. 取得頁面 metadata（標題）
     const page: any = await notion.pages.retrieve({ page_id: pageId });
 
-    // Extract title safe check
     let title = 'Untitled';
     if (page.properties) {
-      // Find the title property (usually named "Name" or "Title")
       const titleProp = Object.values(page.properties).find((p: any) => p.type === 'title') as any;
       if (titleProp && titleProp.title && titleProp.title.length > 0) {
         title = titleProp.title.map((t: any) => t.plain_text).join('');
@@ -52,61 +75,77 @@ async function fetchNotionPage(pageId: string): Promise<NotionContext | null> {
       }
     }
 
-    // 2. Get Page Content (Blocks) -> Markdown
+    // 2. 取得頁面內容（Blocks → Markdown）
     const mdBlocks = await n2m.pageToMarkdown(pageId);
     const mdString = n2m.toMarkdownString(mdBlocks);
 
     return {
       pageId,
-      content: mdString.parent, // usage: .parent contains the markdown string
+      content: mdString.parent,
       title,
       lastUpdated: Date.now(),
     };
   } catch (error) {
-    console.error(`Error fetching Notion page ${pageId}:`, error);
+    console.error(`[Notion] Error fetching page ${pageId}:`, error);
     return null;
   }
 }
 
 /**
- * Cached function to get all Notion data.
- * TTL: 24 hours (86400 seconds)
- * Tags: ['notion-data']
+ * 取得 Notion 知識庫資料（含 In-Memory Cache）
+ *
+ * Cache 策略：
+ * - 同一個 Serverless Instance 生命週期內，TTL（1小時）內直接從記憶體回傳
+ * - TTL 過期或首次呼叫才重新拉 Notion API
  */
-export const getCachedNotionData = unstable_cache(
-  async () => {
-    console.log('[Notion] Cache MISS - Fetching fresh data with Official API...');
-    const pageIds = getNotionPageIds();
+export async function getCachedNotionData() {
+  const now = Date.now();
 
-    if (pageIds.length === 0) {
-      return {
-        combinedContext: 'No Notion pages configured.',
-        pages: [],
-      };
-    }
-
-    const promises = pageIds.map((id) => fetchNotionPage(id));
-    // Filter out nulls
-    const pages = (await Promise.all(promises)).filter((p): p is NotionContext => p !== null);
-
-    const combinedContext = pages
-      .map((p) => `--- Page: ${p.title} ---\n${p.content}`)
-      .join('\n\n') + `\n\n[System Info] Data Fetched At: ${new Date().toISOString()}`;
-
-    return {
-      combinedContext,
-      pages,
-      fetchedAt: Date.now(),
-    };
-  },
-  ['notion-data'],
-  {
-    revalidate: 86400, // Revert to 24 hours
-    tags: ['notion-data'],
+  // ✅ 快取命中：直接從記憶體回傳，不打任何外部 API
+  if (notionDataCache && now < notionDataCache.expiresAt) {
+    console.log('[Notion] Cache HIT - Returning from in-memory cache');
+    return notionDataCache.data;
   }
-);
 
-// --- System Configuration Implementation (Notion DB) ---
+  // ❌ 快取未命中：重新拉 Notion
+  console.log('[Notion] Cache MISS - Fetching fresh data from Notion API...');
+  const pageIds = getNotionPageIds();
+
+  if (pageIds.length === 0) {
+    const emptyResult = {
+      combinedContext: 'No Notion pages configured.',
+      pages: [] as NotionContext[],
+      fetchedAt: now,
+    };
+    notionDataCache = { data: emptyResult, expiresAt: now + NOTION_DATA_TTL_MS };
+    return emptyResult;
+  }
+
+  const promises = pageIds.map((id) => fetchNotionPage(id));
+  const pages = (await Promise.all(promises)).filter((p): p is NotionContext => p !== null);
+
+  const combinedContext =
+    pages.map((p) => `--- Page: ${p.title} ---\n${p.content}`).join('\n\n') +
+    `\n\n[System Info] Data Fetched At: ${new Date().toISOString()}`;
+
+  const result = { combinedContext, pages, fetchedAt: now };
+
+  // 寫入記憶體快取
+  notionDataCache = { data: result, expiresAt: now + NOTION_DATA_TTL_MS };
+  console.log(`[Notion] Cached ${pages.length} page(s). Expires in ${NOTION_DATA_TTL_MS / 60000} minutes.`);
+
+  return result;
+}
+
+/**
+ * 手動清除 Notion 資料快取（供管理介面的「更新知識庫」按鈕使用）
+ */
+export function invalidateNotionCache() {
+  notionDataCache = null;
+  console.log('[Notion] In-memory cache invalidated manually.');
+}
+
+// --- 系統設定（Notion DB）---
 
 export interface SystemConfig {
   AI_ENABLED: boolean;
@@ -117,8 +156,21 @@ export interface SystemConfig {
   ADMIN_LINE_ID?: string;
 }
 
+/**
+ * 取得系統設定（含 In-Memory Cache，TTL 5分鐘）
+ */
 export async function getSystemConfig(): Promise<SystemConfig | null> {
   if (!NOTION_CONFIG_DB_ID) return null;
+
+  const now = Date.now();
+
+  // ✅ 快取命中
+  if (systemConfigCache && now < systemConfigCache.expiresAt) {
+    console.log('[Config] Cache HIT - Returning from in-memory cache');
+    return systemConfigCache.data;
+  }
+
+  console.log('[Config] Cache MISS - Fetching from Notion DB...');
 
   try {
     const response = await (notion.databases as any).query({
@@ -129,10 +181,8 @@ export async function getSystemConfig(): Promise<SystemConfig | null> {
 
     response.results.forEach((page: any) => {
       const props = page.properties;
-      // Expecting "Key" (Title) and "Value" (RichText/Checkbox)
-
-      let key = "";
-      let value: any = "";
+      let key = '';
+      let value: any = '';
 
       if (props.Key && props.Key.title && props.Key.title.length > 0) {
         key = props.Key.title[0].plain_text;
@@ -143,7 +193,6 @@ export async function getSystemConfig(): Promise<SystemConfig | null> {
       }
 
       if (key) {
-        // Type conversion
         if (value === 'true') config[key] = true;
         else if (value === 'false') config[key] = false;
         else if (!isNaN(Number(value)) && key === 'AUTO_SWITCH_MINUTES') config[key] = Number(value);
@@ -151,15 +200,20 @@ export async function getSystemConfig(): Promise<SystemConfig | null> {
       }
     });
 
-    // Split keywords if string
     if (typeof config.HANDOVER_KEYWORDS === 'string') {
       config.HANDOVER_KEYWORDS = config.HANDOVER_KEYWORDS.split(',').map((k: string) => k.trim());
     }
 
-    return config as SystemConfig;
+    const result = config as SystemConfig;
+
+    // 寫入快取
+    systemConfigCache = { data: result, expiresAt: now + SYSTEM_CONFIG_TTL_MS };
+    return result;
 
   } catch (error) {
-    console.error("Error fetching system config:", error);
+    console.error('[Config] Error fetching system config:', error);
+    // 快取錯誤結果（短暫，避免一直重試）
+    systemConfigCache = { data: null, expiresAt: now + 30_000 }; // 30 秒後再試
     return null;
   }
 }
@@ -167,67 +221,64 @@ export async function getSystemConfig(): Promise<SystemConfig | null> {
 export async function updateSystemConfig(key: string, value: string | boolean) {
   if (!NOTION_CONFIG_DB_ID) return;
 
-  // 1. Check if key exists
   const response = await (notion.databases as any).query({
     database_id: NOTION_CONFIG_DB_ID,
     filter: {
       property: 'Key',
-      title: {
-        equals: key
-      }
+      title: { equals: key }
     }
   });
 
   const strValue = String(value);
 
   if (response.results.length > 0) {
-    // Update existing
     const pageId = response.results[0].id;
     await notion.pages.update({
       page_id: pageId,
       properties: {
-        Value: {
-          rich_text: [
-            { text: { content: strValue } }
-          ]
-        }
+        Value: { rich_text: [{ text: { content: strValue } }] }
       }
     });
   } else {
-    // Create new
     await notion.pages.create({
       parent: { database_id: NOTION_CONFIG_DB_ID },
       properties: {
-        Key: {
-          title: [
-            { text: { content: key } }
-          ]
-        },
-        Value: {
-          rich_text: [
-            { text: { content: strValue } }
-          ]
-        }
+        Key: { title: [{ text: { content: key } }] },
+        Value: { rich_text: [{ text: { content: strValue } }] }
       }
     });
   }
+
+  // 清除設定快取，讓下次讀取拿到最新值
+  systemConfigCache = null;
 }
 
-// --- Chat Session Management (Notion DB) ---
+// --- 對話 Session 管理（Notion DB）---
 
 export interface ChatSession {
   lineUserId: string;
   mode: 'AI' | 'Human';
   lastActive: string;
-  pageId?: string; // Notion Page ID representing this row
+  pageId?: string;
 }
 
-
-// --- In-Memory Fallback for Sessions (When DB ID is missing) ---
+/** 本地 Memory Fallback（當 DB ID 未設定時使用） */
 const localSessionStore = new Map<string, ChatSession>();
 
+/**
+ * 取得對話 Session（含 In-Memory Cache，TTL 2分鐘）
+ */
 export async function getChatSession(lineUserId: string): Promise<ChatSession | null> {
-  // 1. Try Notion DB if configured
+  const now = Date.now();
+
+  // ✅ 快取命中
+  const cached = sessionCache.get(lineUserId);
+  if (cached && now < cached.expiresAt) {
+    console.log(`[Session] Cache HIT for ${lineUserId}`);
+    return cached.data;
+  }
+
+  // ❌ 快取未命中：查 Notion DB
   if (NOTION_SESSION_DB_ID) {
     try {
       const response = await (notion.databases as any).query({
@@ -238,32 +289,37 @@ export async function getChatSession(lineUserId: string): Promise<ChatSession | 
         }
       });
 
-      if (response.results.length === 0) return null;
+      if (response.results.length === 0) {
+        sessionCache.set(lineUserId, { data: null, expiresAt: now + SESSION_TTL_MS });
+        return null;
+      }
 
       const page: any = response.results[0];
       const props = page.properties;
 
-      return {
+      const session: ChatSession = {
         lineUserId,
         mode: props.Mode?.select?.name || 'AI',
         lastActive: props.LastActive?.date?.start || new Date().toISOString(),
         pageId: page.id
       };
+
+      // 寫入快取
+      sessionCache.set(lineUserId, { data: session, expiresAt: now + SESSION_TTL_MS });
+      return session;
+
     } catch (error) {
-      console.error("Error fetching chat session from Notion:", error);
-      // Fallback to local if Notion fails? Or just return null?
-      // Let's fallback to local to be safe during config issues
+      console.error('[Session] Error fetching chat session from Notion:', error);
+      // Fallback 到本地
     }
   }
 
-  // 2. Fallback to Local Memory
   return localSessionStore.get(lineUserId) || null;
 }
 
 export async function getActiveHumanSessions(): Promise<ChatSession[]> {
   const sessions: ChatSession[] = [];
 
-  // 1. Notion
   if (NOTION_SESSION_DB_ID) {
     try {
       const response = await (notion.databases as any).query({
@@ -281,14 +337,13 @@ export async function getActiveHumanSessions(): Promise<ChatSession[]> {
       })) as ChatSession[];
       sessions.push(...notionSessions);
     } catch (error) {
-      console.error("Error fetching human sessions from Notion:", error);
+      console.error('[Session] Error fetching human sessions from Notion:', error);
     }
   }
 
-  // 2. Local
+  // Local fallback
   for (const session of localSessionStore.values()) {
     if (session.mode === 'Human') {
-      // Avoid duplicates if both exist (rare case)
       if (!sessions.find(s => s.lineUserId === session.lineUserId)) {
         sessions.push(session);
       }
@@ -301,12 +356,10 @@ export async function getActiveHumanSessions(): Promise<ChatSession[]> {
 export async function updateChatSession(lineUserId: string, mode: 'AI' | 'Human') {
   const now = new Date().toISOString();
 
-  // 1. Try Notion
   if (NOTION_SESSION_DB_ID) {
     try {
-      const existingSession = await getChatSession(lineUserId); // This might get local one if DB missing, handle carefully
+      const existingSession = await getChatSession(lineUserId);
 
-      // We need to check if the *existingSession* actually has a pageId (meaning it came from Notion)
       if (existingSession && existingSession.pageId) {
         await notion.pages.update({
           page_id: existingSession.pageId,
@@ -315,9 +368,7 @@ export async function updateChatSession(lineUserId: string, mode: 'AI' | 'Human'
             LastActive: { date: { start: now } }
           }
         });
-        return; // Success update Notion
       } else {
-        // Create in Notion
         await notion.pages.create({
           parent: { database_id: NOTION_SESSION_DB_ID },
           properties: {
@@ -326,21 +377,17 @@ export async function updateChatSession(lineUserId: string, mode: 'AI' | 'Human'
             LastActive: { date: { start: now } }
           }
         });
-        return; // Success create Notion
       }
+
+      // 更新後清除該用戶的 Session 快取，讓下次讀最新
+      sessionCache.delete(lineUserId);
+      return;
+
     } catch (e) {
-      console.error("Failed to update Notion session DB", e);
-      // Continue to update local as backup
+      console.error('[Session] Failed to update Notion session DB', e);
     }
   }
 
-  // 2. Update Local Memory
-  // Be careful not to overwrite a full object with partial info if we were doing more complex stuff, 
-  // but here we just need mode and time.
-  localSessionStore.set(lineUserId, {
-    lineUserId,
-    mode,
-    lastActive: now
-  });
+  // Fallback: 本地記憶體
+  localSessionStore.set(lineUserId, { lineUserId, mode, lastActive: now });
 }
-
