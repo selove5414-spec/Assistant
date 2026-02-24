@@ -3,6 +3,7 @@ import { validateSignature, WebhookEvent } from '@line/bot-sdk';
 import { lineClient, lineConfig } from '@/lib/line';
 import { getCachedNotionData, getChatSession, updateChatSession } from '@/lib/notion';
 import { generateAnswer } from '@/lib/ai';
+import { withTiming, recordPerformance } from '@/lib/performance';
 
 // --- Configuration from Env ---
 const AI_ENABLED = process.env.AI_ENABLED !== 'false'; // Default true
@@ -130,21 +131,39 @@ export async function POST(req: NextRequest) {
             }
 
             // --- AI Processing (Normal Flow) ---
+            const requestStart = Date.now();
 
             // 4. Update Session (Keep/Set as AI mode)
             // Fire and forget update (don't await to block reply)
             updateChatSession(userId, 'AI').catch(err => console.error("Failed to update session", err));
 
-            // 5. Retrieve Context & Generate Answer
-            const notionData = await getCachedNotionData();
+            // 5. Retrieve Context & Generate Answer（加入計時）
+            const [notionData, notionMs] = await withTiming(() => getCachedNotionData());
             const context = notionData.combinedContext;
+            // 判斷是否快取命中（fetchedAt 在過去 5 秒內代表剛拉取，否則為命中）
+            const notionCacheHit = (Date.now() - (notionData.fetchedAt || 0)) > 5000;
 
             let finalContext = context;
             if (SYSTEM_PROMPT) {
                 finalContext = `[System Instruction]\n${SYSTEM_PROMPT}\n\n${context}`;
             }
 
-            const aiResponse = await generateAnswer(userMessage, finalContext);
+            const [aiResponse, aiMs] = await withTiming(() => generateAnswer(userMessage, finalContext));
+
+            const totalMs = Date.now() - requestStart;
+
+            // 紀錄效能資料
+            recordPerformance({
+                timestamp: requestStart,
+                totalMs,
+                notionMs,
+                notionCacheHit,
+                aiMs,
+                aiProvider: aiResponse.provider,
+                aiModel: aiResponse.modelUsed,
+            });
+
+            console.log(`[Perf] total=${totalMs}ms notion=${notionMs}ms(${notionCacheHit ? 'HIT' : 'MISS'}) ai=${aiMs}ms(${aiResponse.modelUsed})`);
 
             // 6. Reply to LINE
             try {
