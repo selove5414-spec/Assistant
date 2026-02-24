@@ -1,26 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { revalidateTag } from 'next/cache';
-import { fetchNotionDataDirect } from '@/lib/notion';
+import { getCachedNotionData } from '@/lib/notion';
 
 /**
  * POST /api/admin/refresh
  * 強制更新 Notion 知識庫快取
  *
- * 使用 Route Handler（而非 Server Action）的原因：
- * - Server Action 的 revalidateTag 是 deferred（Response 送出後才生效）
- * - Route Handler 的 revalidateTag 在 Response 前即同步生效
- * - 因此可以確保「清除 → 重新拉取 → 回傳最新資料」的正確順序
+ * 執行順序（非常重要）：
+ * 1. revalidateTag('notion-data') — 在 Route Handler 中同步清除 Vercel Data Cache
+ * 2. 等待 500ms — 確保 Data Cache 清除已傳播
+ * 3. getCachedNotionData() — 透過 unstable_cache 重新拉取並「存回」Data Cache
+ *    ★ 必須用 getCachedNotionData（而非 fetchNotionDataDirect），
+ *       這樣新資料才會被寫入 Vercel Data Cache，後續 LINE Bot 才能從快取命中。
  */
 export async function POST(req: NextRequest) {
     try {
         const start = Date.now();
 
-        // 1. 清除 Vercel Data Cache（在 Route Handler 中同步生效）
+        // 1. 清除 Vercel Data Cache（Route Handler 中同步生效）
         // @ts-ignore - Next.js version specific signature
         revalidateTag('notion-data');
 
-        // 2. 直接從 Notion API 拉取最新資料（繞過快取）
-        const data = await fetchNotionDataDirect();
+        // 2. 等待 500ms，確保 Data Cache 清除已完全生效
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        // 3. 透過 unstable_cache 接口重新拉取 Notion 資料
+        //    → 新資料會被寫入 Vercel Data Cache，LINE Bot 後續請求可命中
+        const data = await getCachedNotionData();
 
         const elapsed = Date.now() - start;
 
@@ -29,7 +35,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({
             success: true,
             pageCount: data.pages.length,
-            pageTitles: data.pages.map(p => p.title),
+            pageTitles: data.pages.map((p: any) => p.title),
             fetchedAt: new Date(data.fetchedAt).toISOString(),
             elapsedMs: elapsed,
         });
