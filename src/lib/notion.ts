@@ -1,5 +1,6 @@
 import { Client } from '@notionhq/client';
 import { NotionToMarkdown } from 'notion-to-md';
+import { unstable_cache } from 'next/cache';
 
 // 初始化 Notion 官方 Client
 const notion = new Client({
@@ -30,22 +31,15 @@ export function getNotionPageIds(): string[] {
 }
 
 // ============================================================
-// In-Memory Cache 定義
-// 利用 Serverless Module 層的生命週期，同一個 Instance 內免重複請求
+// Cache 定義
+// - Notion 知識庫：使用 Next.js unstable_cache（Vercel Data Cache，跨 Instance 共享）
+// - 系統設定、Session：使用 In-Memory Cache（同一 Instance 內快速存取）
 // ============================================================
 
 interface MemCacheEntry<T> {
   data: T;
   expiresAt: number;
 }
-
-/** Notion 知識庫快取（TTL: 1小時） */
-let notionDataCache: MemCacheEntry<{
-  combinedContext: string;
-  pages: NotionContext[];
-  fetchedAt: number;
-}> | null = null;
-const NOTION_DATA_TTL_MS = 60 * 60 * 1000; // 1 小時
 
 /** 系統設定快取（TTL: 5分鐘） */
 let systemConfigCache: MemCacheEntry<SystemConfig | null> | null = null;
@@ -92,33 +86,20 @@ async function fetchNotionPage(pageId: string): Promise<NotionContext | null> {
 }
 
 /**
- * 取得 Notion 知識庫資料（含 In-Memory Cache）
- *
- * Cache 策略：
- * - 同一個 Serverless Instance 生命週期內，TTL（1小時）內直接從記憶體回傳
- * - TTL 過期或首次呼叫才重新拉 Notion API
+ * 實際從 Notion 拉取知識庫資料的內部函式
+ * 由 unstable_cache 包裹後對外提供（TTL: 1小時，tag: 'notion-data'）
  */
-export async function getCachedNotionData() {
+async function _fetchNotionData() {
   const now = Date.now();
-
-  // ✅ 快取命中：直接從記憶體回傳，不打任何外部 API
-  if (notionDataCache && now < notionDataCache.expiresAt) {
-    console.log('[Notion] Cache HIT - Returning from in-memory cache');
-    return notionDataCache.data;
-  }
-
-  // ❌ 快取未命中：重新拉 Notion
-  console.log('[Notion] Cache MISS - Fetching fresh data from Notion API...');
+  console.log('[Notion] Fetching fresh data from Notion API...');
   const pageIds = getNotionPageIds();
 
   if (pageIds.length === 0) {
-    const emptyResult = {
+    return {
       combinedContext: 'No Notion pages configured.',
       pages: [] as NotionContext[],
       fetchedAt: now,
     };
-    notionDataCache = { data: emptyResult, expiresAt: now + NOTION_DATA_TTL_MS };
-    return emptyResult;
   }
 
   const promises = pageIds.map((id) => fetchNotionPage(id));
@@ -128,21 +109,33 @@ export async function getCachedNotionData() {
     pages.map((p) => `--- Page: ${p.title} ---\n${p.content}`).join('\n\n') +
     `\n\n[System Info] Data Fetched At: ${new Date().toISOString()}`;
 
-  const result = { combinedContext, pages, fetchedAt: now };
-
-  // 寫入記憶體快取
-  notionDataCache = { data: result, expiresAt: now + NOTION_DATA_TTL_MS };
-  console.log(`[Notion] Cached ${pages.length} page(s). Expires in ${NOTION_DATA_TTL_MS / 60000} minutes.`);
-
-  return result;
+  console.log(`[Notion] Fetched ${pages.length} page(s).`);
+  return { combinedContext, pages, fetchedAt: now };
 }
 
 /**
- * 手動清除 Notion 資料快取（供管理介面的「更新知識庫」按鈕使用）
+ * 取得 Notion 知識庫資料（使用 Next.js Data Cache，跨 Vercel Instance 共享）
+ *
+ * Cache 策略：
+ * - TTL 1 小時，tag: 'notion-data'
+ * - 呼叫 revalidateTag('notion-data') 可跨所有 Instance 即時清除
+ */
+export const getCachedNotionData = unstable_cache(
+  _fetchNotionData,
+  ['notion-data'],
+  {
+    revalidate: 3600, // 1 小時
+    tags: ['notion-data'],
+  }
+);
+
+/**
+ * 手動清除 Notion 資料快取（保留此函式以相容舊呼叫方）
+ * 實際清除操作由 Server Action（actions.ts）使用 revalidateTag 處理
  */
 export function invalidateNotionCache() {
-  notionDataCache = null;
-  console.log('[Notion] In-memory cache invalidated manually.');
+  // 實際清除已移至 actions.ts 中用 revalidateTag 處理
+  console.log('[Notion] invalidateNotionCache called (no-op; use revalidateTag in Server Actions).');
 }
 
 // --- 系統設定（Notion DB）---
