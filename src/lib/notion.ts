@@ -1,6 +1,5 @@
 import { Client } from '@notionhq/client';
 import { NotionToMarkdown } from 'notion-to-md';
-import { unstable_cache } from 'next/cache';
 
 // 初始化 Notion 官方 Client
 const notion = new Client({
@@ -15,6 +14,8 @@ export interface NotionContext {
   content: string; // Markdown 內容
   title?: string;
   lastUpdated: number;
+  /** Notion 頁面的最後修改時間（ISO string），供快取失效驗證使用 */
+  notionLastEdited?: string;
 }
 
 // Database IDs（來自 .env）
@@ -32,8 +33,8 @@ export function getNotionPageIds(): string[] {
 
 // ============================================================
 // Cache 定義
-// - Notion 知識庫：使用 Next.js unstable_cache（Vercel Data Cache，跨 Instance 共享）
-// - 系統設定、Session：使用 In-Memory Cache（同一 Instance 內快速存取）
+// - Notion 知識庫：In-Memory 快取 + last_edited_time 自動失效
+// - 系統設定、Session：In-Memory Cache（同一 Instance 內快速存取）
 // ============================================================
 
 interface MemCacheEntry<T> {
@@ -49,14 +50,30 @@ const SYSTEM_CONFIG_TTL_MS = 5 * 60 * 1000; // 5 分鐘
 const sessionCache = new Map<string, MemCacheEntry<ChatSession | null>>();
 const SESSION_TTL_MS = 2 * 60 * 1000; // 2 分鐘
 
-// ============================================================
+/**
+ * Notion 知識庫 In-Memory 快取（TTL: 1小時）
+ * 搭配 last_edited_time 驗證，Notion 有修改時自動失效（無需跨 Instance 同步）
+ */
+interface NotionDataCacheEntry {
+  data: {
+    combinedContext: string;
+    pages: NotionContext[];
+    fetchedAt: number;
+  };
+  expiresAt: number;
+  /** Notion 所有配置頁面的最新 last_edited_time */
+  notionLastEditedAt: string;
+}
+let notionDataCache: NotionDataCacheEntry | null = null;
+const NOTION_DATA_TTL_MS = 60 * 60 * 1000; // 1 小時
 
 /**
  * 從單一 Notion 頁面讀取資料，轉成 Markdown
+ * 同時回傳 last_edited_time 供快取失效驗證使用
  */
 async function fetchNotionPage(pageId: string): Promise<NotionContext | null> {
   try {
-    // 1. 取得頁面 metadata（標題）
+    // 1. 取得頁面 metadata（標題 + last_edited_time）
     const page: any = await notion.pages.retrieve({ page_id: pageId });
 
     let title = 'Untitled';
@@ -78,6 +95,7 @@ async function fetchNotionPage(pageId: string): Promise<NotionContext | null> {
       content: mdString.parent,
       title,
       lastUpdated: Date.now(),
+      notionLastEdited: page.last_edited_time as string || new Date().toISOString(),
     };
   } catch (error) {
     console.error(`[Notion] Error fetching page ${pageId}:`, error);
@@ -86,8 +104,7 @@ async function fetchNotionPage(pageId: string): Promise<NotionContext | null> {
 }
 
 /**
- * 實際從 Notion 拉取知識庫資料的內部函式
- * 由 unstable_cache 包裹後對外提供（TTL: 1小時，tag: 'notion-data'）
+ * 實際從 Notion 拉取知識庫資料的內部函式（完整讀取，不包含快取邏輯）
  */
 async function _fetchNotionData() {
   const now = Date.now();
@@ -114,36 +131,107 @@ async function _fetchNotionData() {
 }
 
 /**
- * 取得 Notion 知識庫資料（使用 Next.js Data Cache，跨 Vercel Instance 共享）
- *
- * Cache 策略：
- * - TTL 1 小時，tag: 'notion-data'
- * - 呼叫 revalidateTag('notion-data') 可跨所有 Instance 即時清除
+ * 快速讀取所有 Notion 頁面的 last_edited_time（純 metadata，不讀內容）
+ * 用於驗證快取是否仍有效
  */
-export const getCachedNotionData = unstable_cache(
-  _fetchNotionData,
-  ['notion-data'],
-  {
-    revalidate: 3600, // 1 小時
-    tags: ['notion-data'],
+async function getNotionPagesLastEdited(): Promise<string | null> {
+  const pageIds = getNotionPageIds();
+  if (pageIds.length === 0) return null;
+  try {
+    const times = await Promise.all(
+      pageIds.map(async (id) => {
+        const page: any = await notion.pages.retrieve({ page_id: id });
+        return page.last_edited_time as string;
+      })
+    );
+    // 回傳最新的一個（ISO string 可直接排序比較）
+    return times.filter(Boolean).sort().reverse()[0] ?? null;
+  } catch (e) {
+    console.warn('[Notion] Failed to read last_edited_time:', e);
+    return null; // 失敗時保守處理，不清除快取
   }
-);
-
-/**
- * 手動清除 Notion 資料快取（保留此函式以相容舊呼叫方）
- * 實際清除操作由 Server Action（actions.ts）使用 revalidateTag 處理
- */
-export function invalidateNotionCache() {
-  // 實際清除已移至 actions.ts 中用 revalidateTag 處理
-  console.log('[Notion] invalidateNotionCache called (no-op; use revalidateTag in Server Actions).');
 }
 
 /**
- * 直接從 Notion API 拉取最新資料，完全繞過快取
- * 供 API Route Handler 使用，用於強制更新知識庫
+ * 取得 Notion 知識庫資料（In-Memory + last_edited_time 自動失效）
+ *
+ * 快取策略：
+ * - TTL 1 小時（防止永久快取）
+ * - 每次快取命中時，輕量讀取 Notion last_edited_time
+ * - 若 Notion 有任何修改（比快取版本新），自動清除並重新拉取
+ * - 這樣 Notion 修改後，下次 LINE Bot 請求即會自動讀到最新資料
+ *   完全不需要 revalidateTag 或跨 Instance 通訊
+ */
+export async function getCachedNotionData() {
+  const now = Date.now();
+
+  // ✅ 快取命中：先確認 Notion 是否有更新
+  if (notionDataCache && now < notionDataCache.expiresAt) {
+    const latestEdit = await getNotionPagesLastEdited();
+
+    if (latestEdit && latestEdit > notionDataCache.notionLastEditedAt) {
+      // Notion 有新修改，清除快取
+      console.log(`[Notion] Notion updated (${latestEdit} > ${notionDataCache.notionLastEditedAt}), invalidating cache.`);
+      notionDataCache = null;
+    } else {
+      // 快取有效，直接返回
+      console.log('[Notion] Cache HIT (Notion not modified)');
+      return notionDataCache.data;
+    }
+  }
+
+  // ❌ 快取未命中（TTL 到期或 Notion 有更新）：重新拉取
+  console.log('[Notion] Cache MISS - Fetching from Notion API...');
+  const data = await _fetchNotionData();
+
+  // 計算所有頁面的最新 last_edited_time
+  const latestEdit = data.pages.length > 0
+    ? data.pages
+      .map((p: NotionContext) => p.notionLastEdited || '')
+      .filter(Boolean)
+      .sort()
+      .reverse()[0]
+    : new Date().toISOString();
+
+  notionDataCache = {
+    data,
+    expiresAt: now + NOTION_DATA_TTL_MS,
+    notionLastEditedAt: latestEdit,
+  };
+
+  return data;
+}
+
+/**
+ * 手動清除 Notion 資料快取（立即生效於當前 Instance）
+ * 注意：不同 Serverless Function 有各自的 In-Memory，
+ * 但有了 last_edited_time 驗證，Notion 修改後任何 Instance 的下次請求都會自動更新
+ */
+export function invalidateNotionCache() {
+  notionDataCache = null;
+  console.log('[Notion] In-memory cache manually cleared.');
+}
+
+/**
+ * 直接從 Notion API 拉取最新資料（繞過快取）
+ * 供 /api/admin/refresh 使用（清除後重新拉取並更新快取）
  */
 export async function fetchNotionDataDirect() {
-  return _fetchNotionData();
+  const data = await _fetchNotionData();
+
+  // 更新 In-Memory 快取（此 Instance 的）
+  const now = Date.now();
+  const latestEdit = data.pages.length > 0
+    ? data.pages.map((p: NotionContext) => p.notionLastEdited || '').filter(Boolean).sort().reverse()[0]
+    : new Date().toISOString();
+
+  notionDataCache = {
+    data,
+    expiresAt: now + NOTION_DATA_TTL_MS,
+    notionLastEditedAt: latestEdit,
+  };
+
+  return data;
 }
 
 // --- 系統設定（Notion DB）---

@@ -1,34 +1,35 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { revalidateTag } from 'next/cache';
-import { getCachedNotionData } from '@/lib/notion';
+import { fetchNotionDataDirect } from '@/lib/notion';
 
 /**
  * POST /api/admin/refresh
- * 強制更新 Notion 知識庫快取
+ * 強制更新 Notion 知識庫（繞過快取直接拉取最新資料）
  *
- * 執行順序（非常重要）：
- * 1. revalidateTag('notion-data') — 在 Route Handler 中同步清除 Vercel Data Cache
- * 2. 等待 500ms — 確保 Data Cache 清除已傳播
- * 3. getCachedNotionData() — 透過 unstable_cache 重新拉取並「存回」Data Cache
- *    ★ 必須用 getCachedNotionData（而非 fetchNotionDataDirect），
- *       這樣新資料才會被寫入 Vercel Data Cache，後續 LINE Bot 才能從快取命中。
+ * 此版本直接使用 fetchNotionDataDirect，它會：
+ * 1. 直接呼叫 Notion API 拉取最新資料
+ * 2. 更新此 Instance 的 In-Memory 快取（包含最新的 notionLastEditedAt）
+ *
+ * 對於其他 Serverless Function Instance（如 /api/line）：
+ * - 因為每個頁面都記錄了 last_edited_time，下次請求自動偵測 Notion 有更新就會清除快取
+ * - 不需要 revalidateTag 或跨 Instance 通訊
  */
 export async function POST(req: NextRequest) {
     try {
         const start = Date.now();
 
-        // 1. 清除 Vercel Data Cache（Route Handler 中同步生效）
-        // @ts-ignore - Next.js version specific signature
-        revalidateTag('notion-data');
-
-        // 2. 等待 500ms，確保 Data Cache 清除已完全生效
-        await new Promise(resolve => setTimeout(resolve, 500));
-
-        // 3. 透過 unstable_cache 接口重新拉取 Notion 資料
-        //    → 新資料會被寫入 Vercel Data Cache，LINE Bot 後續請求可命中
-        const data = await getCachedNotionData();
+        // 直接從 Notion API 拉取最新資料（繞過快取並更新此 Instance 的快取）
+        const data = await fetchNotionDataDirect();
 
         const elapsed = Date.now() - start;
+
+        // 顯示最新的 notionLastEditedAt，供用戶確認資料時間
+        const latestEdit = data.pages.length > 0
+            ? data.pages
+                .map((p: any) => p.notionLastEdited || '')
+                .filter(Boolean)
+                .sort()
+                .reverse()[0]
+            : null;
 
         console.log(`[Admin Refresh] Notion data refreshed in ${elapsed}ms. Pages: ${data.pages.length}`);
 
@@ -36,6 +37,7 @@ export async function POST(req: NextRequest) {
             success: true,
             pageCount: data.pages.length,
             pageTitles: data.pages.map((p: any) => p.title),
+            notionLastEdited: latestEdit, // Notion 頁面的實際最後修改時間
             fetchedAt: new Date(data.fetchedAt).toISOString(),
             elapsedMs: elapsed,
         });
