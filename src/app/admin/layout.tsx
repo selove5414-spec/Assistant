@@ -1,5 +1,5 @@
 import Link from "next/link"
-import { LayoutDashboard, Settings, MessageSquare, Bot, Menu, BarChart2 } from "lucide-react"
+import { LayoutDashboard, Settings, BarChart2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -57,14 +57,6 @@ function AppSidebar() {
                             <Link href="/admin/settings">
                                 <Settings />
                                 <span>系統設定</span>
-                            </Link>
-                        </SidebarMenuButton>
-                    </SidebarMenuItem>
-                    <SidebarMenuItem>
-                        <SidebarMenuButton asChild>
-                            <Link href="/admin/agent">
-                                <Bot />
-                                <span>真人客服</span>
                             </Link>
                         </SidebarMenuButton>
                     </SidebarMenuItem>
