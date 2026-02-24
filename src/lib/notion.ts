@@ -138,6 +138,14 @@ export function invalidateNotionCache() {
   console.log('[Notion] invalidateNotionCache called (no-op; use revalidateTag in Server Actions).');
 }
 
+/**
+ * 直接從 Notion API 拉取最新資料，完全繞過快取
+ * 供 API Route Handler 使用，用於強制更新知識庫
+ */
+export async function fetchNotionDataDirect() {
+  return _fetchNotionData();
+}
+
 // --- 系統設定（Notion DB）---
 
 export interface SystemConfig {
