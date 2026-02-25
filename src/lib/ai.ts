@@ -2,7 +2,8 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Groq } from 'groq-sdk';
 
 // --- Configuration ---
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || '';
+// 支援多組 GOOGLE_API_KEY，以逗號分隔
+const GOOGLE_API_KEYS = (process.env.GOOGLE_API_KEY || '').split(',').map(k => k.trim()).filter(Boolean);
 const GEMINI_MODEL_NAME = process.env.GEMINI_MODEL_NAME || 'gemini-1.5-flash';
 const SCHOOL_NAME = process.env.SCHOOL_NAME || '導師室';
 
@@ -14,8 +15,10 @@ const GROQ_MODEL_NAME = process.env.GROQ_MODEL_NAME || 'gemma2-9b-it';
 const AI_TEMPERATURE = parseFloat(process.env.AI_TEMPERATURE || '0.0');
 
 // --- Clients ---
-const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
 const groq = new Groq({ apiKey: GROQ_API_KEY });
+
+// 追蹤目前使用的 Gemini Key 索引 (簡易的 Round-robin 或直接從 0 開始嘗試)
+let currentGeminiKeyIndex = 0;
 
 export interface AiResponse {
     text: string;
@@ -51,68 +54,85 @@ ${context}
 3. 全程使用繁體中文
 `;
 
-    // 1. Try Gemini
-    try {
-        if (!GOOGLE_API_KEY) throw new Error('GOOGLE_API_KEY is missing');
+    // 1. Try Gemini (多把 Key 輪詢嘗試)
+    if (GOOGLE_API_KEYS.length === 0) {
+        console.warn('[AI] No Google API Keys found. Skipping Gemini.');
+    } else {
+        // 嘗試所有的 Gemini Keys，最多試 GOOGLE_API_KEYS.length 次
+        let attempts = 0;
+        let lastGeminiError: any = null;
 
-        console.log(`[AI] Attempting Primary (Gemini): ${GEMINI_MODEL_NAME}`);
-        const model = genAI.getGenerativeModel({
-            model: GEMINI_MODEL_NAME,
-            generationConfig: {
-                temperature: AI_TEMPERATURE,
+        while (attempts < GOOGLE_API_KEYS.length) {
+            const apiKeyToUse = GOOGLE_API_KEYS[currentGeminiKeyIndex];
+            const genAI = new GoogleGenerativeAI(apiKeyToUse);
+
+            try {
+                console.log(`[AI] Attempting Primary (Gemini) with Key Index [${currentGeminiKeyIndex}]: ${GEMINI_MODEL_NAME}`);
+                const model = genAI.getGenerativeModel({
+                    model: GEMINI_MODEL_NAME,
+                    generationConfig: {
+                        temperature: AI_TEMPERATURE,
+                    }
+                });
+
+                const result = await model.generateContent([systemPrompt, query]);
+                const response = await result.response;
+                const text = response.text();
+
+                return {
+                    text,
+                    modelUsed: `${GEMINI_MODEL_NAME} (Key ${currentGeminiKeyIndex + 1})`,
+                    provider: 'Gemini'
+                };
+            } catch (err: any) {
+                lastGeminiError = err;
+                console.warn(`[AI] Gemini Key Index [${currentGeminiKeyIndex}] failed: ${err.message}.`);
+
+                // 切換到下一把 Key
+                currentGeminiKeyIndex = (currentGeminiKeyIndex + 1) % GOOGLE_API_KEYS.length;
+                attempts++;
             }
+        }
+
+        console.warn(`[AI] All Gemini keys failed. Last error: ${lastGeminiError?.message}. Switching to Fallback (Groq)...`);
+    }
+
+    // 2. Try Groq (Fallback)
+    try {
+        if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY is missing');
+
+        console.log(`[AI] Attempting Fallback (Groq): ${GROQ_MODEL_NAME}`);
+
+        const completion = await groq.chat.completions.create({
+            messages: [
+                {
+                    role: 'system',
+                    content: systemPrompt
+                },
+                {
+                    role: 'user',
+                    content: query
+                }
+            ],
+            model: GROQ_MODEL_NAME,
+            temperature: AI_TEMPERATURE,
         });
 
-        const result = await model.generateContent([systemPrompt, query]);
-        const response = await result.response;
-        const text = response.text();
+        const text = completion.choices[0]?.message?.content || '';
 
         return {
             text,
-            modelUsed: GEMINI_MODEL_NAME,
-            provider: 'Gemini'
+            modelUsed: GROQ_MODEL_NAME,
+            provider: 'Groq'
         };
 
-    } catch (geminiError: any) {
-        console.warn(`[AI] Gemini failed: ${geminiError.message}. Switching to Fallback (Groq)...`);
+    } catch (groqError: any) {
+        console.error(`[AI] Groq also failed: ${groqError.message}`);
 
-        // 2. Try Groq (Fallback)
-        try {
-            if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY is missing');
-
-            console.log(`[AI] Attempting Fallback (Groq): ${GROQ_MODEL_NAME}`);
-
-            const completion = await groq.chat.completions.create({
-                messages: [
-                    {
-                        role: 'system',
-                        content: systemPrompt
-                    },
-                    {
-                        role: 'user',
-                        content: query
-                    }
-                ],
-                model: GROQ_MODEL_NAME,
-                temperature: AI_TEMPERATURE,
-            });
-
-            const text = completion.choices[0]?.message?.content || '';
-
-            return {
-                text,
-                modelUsed: GROQ_MODEL_NAME,
-                provider: 'Groq'
-            };
-
-        } catch (groqError: any) {
-            console.error(`[AI] Groq also failed: ${groqError.message}`);
-
-            return {
-                text: `抱歉，系統目前忙碌中 (AI Service Unavailable)。\n\n[Primary Error]: ${geminiError.message}\n\n[Fallback Error]: ${groqError.message}`,
-                modelUsed: 'none',
-                provider: 'Gemini' // technically failed both, but keep type safe
-            };
-        }
+        return {
+            text: `抱歉，系統目前忙碌中 (AI Service Unavailable)。\n\n[Primary Error]: All Gemini keys failed\n\n[Fallback Error]: ${groqError.message}`,
+            modelUsed: 'none',
+            provider: 'Gemini' // technically failed both, but keep type safe
+        };
     }
 }

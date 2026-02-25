@@ -4,7 +4,7 @@
 
 ## ✨ 主要功能
 
-- **雙 AI 模型架構**：主要使用 Gemini，備援切換至 Groq，確保服務不中斷
+- **雙/多 AI 模型架構**：主力使用 Gemini (支援多組 API Key 自動輪詢備援)，全面失效才切換至 Groq，確保服務不中斷
 - **Notion 知識庫整合**：自動讀取指定 Notion 頁面並快取，加速回應
 - **In-Memory 快取**：同一伺服器 Instance 內，知識庫資料直接從記憶體回傳（TTL 1小時），大幅減少延遲
 - **真人轉接機制**：用戶可觸發關鍵字轉接真人，並自動通知管理員
@@ -67,7 +67,7 @@ cp .env.example .env
 
 | 變數 | 必填 | 說明 |
 | :--- | :---: | :--- |
-| `GOOGLE_API_KEY` | ✅ | Google AI Studio API Key |
+| `GOOGLE_API_KEY` | ✅ | Google AI Studio API Key (可用逗號分隔多組，自動輪詢) |
 | `GEMINI_MODEL_NAME` | | Gemini 模型名稱，預設 `gemini-1.5-flash` |
 | `GROQ_API_KEY` | ✅ | Groq Cloud API Key |
 | `GROQ_MODEL_NAME` | | Groq 模型名稱，預設 `gemma2-9b-it` |
